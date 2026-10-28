@@ -1,0 +1,32 @@
+# Render 蓝图 —— 让部署变成"点一下"
+# =====================================
+# 用法：把本仓库推到 GitHub 后，在 Render 选 "Blueprint"，
+# 它会自动读取本文件，不用手工填任何配置。
+#
+# 若你想手工建 Web Service，也可以照抄下面的值：
+#   Environment : Python 3
+#   Build Cmd   : pip install -r requirements.txt
+#   Start Cmd   : gunicorn -c gunicorn.conf.py wsgi:application
+#   Health Path : /api/health
+services:
+  - type: web
+    name: stocklens
+    runtime: python
+    plan: free            # 免费档：够用，闲置 15 分钟休眠，下次访问约 30 秒冷启动
+    region: singapore     # 离国内最近的节点，速度最好
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn -c gunicorn.conf.py wsgi:application
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TZ
+        value: Asia/Shanghai
+      # 免费档内存小：单进程 + 多线程，避免 OOM
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: WEB_THREADS
+        value: "8"
+      - key: LOG_LEVEL
+        value: info

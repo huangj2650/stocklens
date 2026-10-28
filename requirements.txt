@@ -1,0 +1,16 @@
+# StockLens 运行依赖
+# 安装：pip install -r requirements.txt
+
+Flask>=3.0,<4.0
+gunicorn>=21.0
+requests>=2.31
+pandas>=2.0
+numpy>=1.24
+
+# 行情数据源
+akshare>=1.12
+yfinance>=0.2.40
+
+# akshare 依赖（部分环境需显式声明）
+beautifulsoup4>=4.12
+lxml>=4.9
