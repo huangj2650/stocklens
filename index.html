@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StockLens · 股票分析体系</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <span class="brand-name">StockLens</span>
+    <span class="brand-sub">股票分析体系</span>
+  </div>
+  <div class="search-wrap">
+    <input id="searchInput" type="text" placeholder="输入代码或名称，如 600519 / 贵州茅台 / AAPL / 00700" autocomplete="off">
+    <button id="searchBtn">分析</button>
+    <div id="suggestBox" class="suggest hidden"></div>
+  </div>
+  <div class="topbar-actions">
+    <button id="refreshBtn" class="ghost-btn" title="刷新全部数据">⟳ 刷新</button>
+    <button id="favBtn" class="ghost-btn" title="加入自选">☆ 自选</button>
+  </div>
+</header>
+
+<div class="ticker-tape" id="marketBar">加载大盘数据…</div>
+
+<!-- 板块切换 -->
+<nav class="board-nav" id="boardNav">
+  <button class="bnav active" data-board="news">
+    <span class="bn-ico">📰</span><span class="bn-txt">金融热点新闻</span>
+  </button>
+  <button class="bnav" data-board="hot">
+    <span class="bn-ico">🔥</span><span class="bn-txt">市场热点</span>
+  </button>
+  <button class="bnav" data-board="watch">
+    <span class="bn-ico">⭐</span><span class="bn-txt">我的自选股</span>
+  </button>
+  <button class="bnav" data-board="tech">
+    <span class="bn-ico">📈</span><span class="bn-txt">技术分析与选股</span>
+  </button>
+</nav>
+
+<main class="board-area">
+
+  <!-- ============================================ 板块1：金融热点新闻 -->
+  <section class="board active" id="board-news">
+    <div class="board-head">
+      <h2>① 最新金融热点新闻</h2>
+      <div class="head-tools">
+        <span class="live-dot"></span>
+        <span class="head-note" id="newsTime">实时更新</span>
+      </div>
+    </div>
+    <div class="news-layout">
+      <div class="card news-main">
+        <div class="news-filter">
+          <button class="nf active" data-src="all">全部</button>
+          <button class="nf" data-src="东方财富">东方财富</button>
+          <button class="nf" data-src="新浪财经">新浪财经</button>
+        </div>
+        <ul class="news-list" id="newsList"><li class="ph">加载中…</li></ul>
+      </div>
+      <div class="news-side">
+        <section class="card">
+          <h3 class="card-title">市场情绪</h3>
+          <div id="sentimentBox"><div class="ph">—</div></div>
+        </section>
+        <section class="card">
+          <h3 class="card-title">涨幅榜</h3>
+          <ul class="rank-list" id="newsGainers"><li class="ph">—</li></ul>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================ 板块2：市场热点 -->
+  <section class="board" id="board-hot">
+    <div class="board-head">
+      <h2>② 市场关注的热点</h2>
+      <div class="head-tools">
+        <div class="tabs" id="sectorTabs">
+          <button class="tab active" data-kind="industry">行业板块</button>
+          <button class="tab" data-kind="concept">概念板块</button>
+          <button class="tab" data-kind="region">地域板块</button>
+        </div>
+      </div>
+    </div>
+    <div class="hot-layout">
+      <section class="card">
+        <h3 class="card-title">板块涨幅排行</h3>
+        <div class="sector-grid" id="sectorGrid"><div class="ph">加载中…</div></div>
+      </section>
+      <section class="card">
+        <h3 class="card-title">板块成分股 <span class="dim" id="sectorStockTitle">（点击左侧板块查看）</span></h3>
+        <div class="table-wrap">
+          <table class="data-table" id="sectorStockTable">
+            <thead><tr><th>代码</th><th>名称</th><th class="num">现价</th><th class="num">涨跌幅</th><th></th></tr></thead>
+            <tbody><tr><td colspan="5" class="ph">—</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <div class="hot-layout-2">
+      <section class="card">
+        <h3 class="card-title">成交额榜</h3>
+        <ul class="rank-list" id="rankAmount"><li class="ph">加载中…</li></ul>
+      </section>
+      <section class="card">
+        <h3 class="card-title">涨幅榜</h3>
+        <ul class="rank-list" id="rankGainers"><li class="ph">加载中…</li></ul>
+      </section>
+      <section class="card">
+        <h3 class="card-title">跌幅榜</h3>
+        <ul class="rank-list" id="rankLosers"><li class="ph">加载中…</li></ul>
+      </section>
+    </div>
+  </section>
+
+  <!-- ============================================ 板块3：我的自选股 -->
+  <section class="board" id="board-watch">
+    <div class="board-head">
+      <h2>③ 我的自选股</h2>
+      <div class="head-tools">
+        <input id="watchAddInput" type="text" placeholder="添加代码，如 600519" class="mini-input">
+        <button id="watchAddBtn" class="mini-btn">+ 添加</button>
+      </div>
+    </div>
+    <section class="card">
+      <div class="table-wrap">
+        <table class="data-table" id="watchTable">
+          <thead>
+            <tr>
+              <th>名称</th><th>代码</th><th class="num">现价</th><th class="num">涨跌额</th>
+              <th class="num">涨跌幅</th><th class="num">评分</th><th>信号</th><th></th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="8" class="ph">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card">
+      <h3 class="card-title">自选股评分对比</h3>
+      <div id="watchChart" class="chart chart-mid"></div>
+    </section>
+  </section>
+
+  <!-- ============================================ 板块4：技术分析与选股 -->
+  <section class="board" id="board-tech">
+    <div class="board-head">
+      <h2>④ 技术分析与选股</h2>
+      <div class="head-tools">
+        <span class="head-note" id="techSymbolNote">当前标的</span>
+      </div>
+    </div>
+
+    <div class="tech-layout">
+      <!-- 左：技术分析 -->
+      <div class="tech-left">
+        <section class="card stock-head" id="stockHead">
+          <div class="ph">在顶部搜索框输入股票代码，或从其他板块点击个股</div>
+        </section>
+        <section class="card score-card">
+          <h3 class="card-title">综合评分</h3>
+          <div class="score-body">
+            <div class="gauge-wrap"><div id="gauge"></div></div>
+            <div class="score-meta">
+              <div class="signal-badge" id="signalBadge">—</div>
+              <div class="dim-list" id="dimList"></div>
+            </div>
+          </div>
+        </section>
+        <section class="card">
+          <h3 class="card-title">关键价位</h3>
+          <div id="srBox" class="sr-box"><div class="ph">—</div></div>
+        </section>
+        <section class="card">
+          <h3 class="card-title">盘面解读</h3>
+          <div class="tabbar" id="reasonTabs">
+            <button class="rtab active" data-tab="bull">看多理由</button>
+            <button class="rtab" data-tab="bear">看空理由</button>
+          </div>
+          <ul class="reason-list" id="reasonList"><li class="ph">—</li></ul>
+        </section>
+      </div>
+
+      <!-- 右：图表 + 指标 -->
+      <div class="tech-right">
+        <section class="card chart-card">
+          <div class="chart-toolbar">
+            <div class="tabs" id="periodTabs">
+              <button class="tab" data-days="60">近3月</button>
+              <button class="tab active" data-days="120">近半年</button>
+              <button class="tab" data-days="250">近1年</button>
+              <button class="tab" data-days="500">近2年</button>
+            </div>
+            <div class="indicator-toggles" id="indToggles">
+              <label><input type="checkbox" data-ind="ma" checked> 均线</label>
+              <label><input type="checkbox" data-ind="boll"> BOLL</label>
+            </div>
+          </div>
+          <div id="klineChart" class="chart chart-tall"></div>
+          <div id="volChart" class="chart chart-short"></div>
+          <div id="macdChart" class="chart chart-short"></div>
+          <div id="kdjChart" class="chart chart-short"></div>
+          <div id="rsiChart" class="chart chart-short"></div>
+        </section>
+        <div class="tech-metrics">
+          <section class="card">
+            <h3 class="card-title">技术指标速览</h3>
+            <div class="metric-grid" id="metricGrid"><div class="ph">—</div></div>
+          </section>
+          <section class="card">
+            <h3 class="card-title">基本面指标</h3>
+            <div class="metric-grid" id="finGrid"><div class="ph">—</div></div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- 选股器 -->
+    <section class="card screener-card">
+      <h3 class="card-title">技术选股器 · 按指标筛选股票</h3>
+      <div class="screener-presets" id="screenerPresets"></div>
+      <div class="screener-toolbar">
+        <div class="scr-opt">
+          <label>候选池规模</label>
+          <select id="scrPool">
+            <option value="60">60 只（快）</option>
+            <option value="120" selected>120 只（推荐）</option>
+            <option value="200">200 只（慢）</option>
+          </select>
+        </div>
+        <div class="scr-opt">
+          <label>最低成交额</label>
+          <select id="scrAmount">
+            <option value="50000000">5000万</option>
+            <option value="100000000" selected>1亿</option>
+            <option value="500000000">5亿</option>
+          </select>
+        </div>
+        <button id="scrRunBtn" class="primary-btn">开始选股</button>
+        <span class="scr-status" id="scrStatus"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="screenerTable">
+          <thead>
+            <tr><th>代码</th><th>名称</th><th class="num">现价</th><th class="num">涨跌幅</th>
+                <th class="num">评分</th><th>信号</th><th>命中条件</th><th></th></tr>
+          </thead>
+          <tbody><tr><td colspan="8" class="ph">选择上方策略后点击「开始选股」</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+</main>
+
+<div class="disclaimer">
+  ⚠️ 本体系基于公开行情数据自动计算，新闻来自公开媒体聚合，所有评分与信号仅供研究参考，<b>不构成任何投资建议</b>。股市有风险，投资需谨慎。
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
