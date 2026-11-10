@@ -635,6 +635,114 @@ def get_quote(symbol: str, market: Optional[str] = None) -> dict:
     return out
 
 
+# ----------------------------------------------------------------------------
+# 多周期 K 线（分时 / 日K / 周K / 月K）
+# ----------------------------------------------------------------------------
+# 实测结论（本环境 + Render 通用）：
+#   ✅ A股分时    : ak.stock_zh_a_minute(period=1/5/15/30/60)  新浪源，稳定
+#   ✅ 周K/月K    : 由日线本地重采样（最稳，无外部依赖，A/港/美通用）
+#   ❌ 港股分时   : 东财 min 接口被断连、腾讯 ifzq 不可达、新浪 quote 接口失效
+#   ❌ 美股分时   : ak.stock_us_hist_min_em 依赖东财 push2，本环境被拦
+# 因此：A 股给完整分时；港/美给"近30日/60日 日K + 周K/月K"，并明确提示原因。
+# ----------------------------------------------------------------------------
+PERIOD_MAP = {
+    "min1":   {"label": "1分",  "kind": "minute", "ak": "1",  "desc": "1 分钟 K"},
+    "min5":   {"label": "5分",  "kind": "minute", "ak": "5",  "desc": "5 分钟 K"},
+    "min15":  {"label": "15分", "kind": "minute", "ak": "15", "desc": "15 分钟 K"},
+    "min30":  {"label": "30分", "kind": "minute", "ak": "30", "desc": "30 分钟 K"},
+    "min60":  {"label": "60分", "kind": "minute", "ak": "60", "desc": "60 分钟 K"},
+    "day5":   {"label": "5日",  "kind": "day",    "days": 5,    "desc": "近 5 交易日"},
+    "day30":  {"label": "30日", "kind": "day",    "days": 30,   "desc": "近 30 交易日"},
+    "day90":  {"label": "日K",  "kind": "day",    "days": 90,   "desc": "近 90 交易日"},
+    "day250": {"label": "年K",  "kind": "day",    "days": 250,  "desc": "近 1 年"},
+    "week":   {"label": "周K",  "kind": "week",   "days": 500,  "desc": "周线（近 2 年）"},
+    "month":  {"label": "月K",  "kind": "month",  "days": 1000, "desc": "月线（近 4 年）"},
+}
+
+
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """把日线重采样为周/月线。df 需含 date/open/high/low/close/volume。"""
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.set_index("date").sort_index()
+    agg = {"open": "first", "high": "max", "low": "min",
+           "close": "last", "volume": "sum"}
+    agg = {k: v for k, v in agg.items() if k in d.columns}
+    out = d.resample(rule).agg(agg).dropna(subset=["close"]).reset_index()
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    return out
+
+
+def _minute_bars(symbol: str, market: Optional[str], period: str,
+                 limit: int = 480) -> tuple[pd.DataFrame, dict]:
+    """分钟级 K 线（仅 A 股可用）。返回 (df, info)。"""
+    info = normalize_symbol(symbol, market)
+    if info["market"] != "A":
+        raise ValueError("MINUTE_UNSUPPORTED")
+    import akshare as ak
+    key = f"min_{info['code']}_{period}"
+    df = cached_frame(key, lambda: ak.stock_zh_a_minute(
+        symbol=info["ak_symbol"], period=period, adjust=""), ttl=120, disk_ttl=1800)
+    df = df.rename(columns={"day": "date"})
+    for c in ("open", "high", "low", "close", "volume"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"]).tail(limit).reset_index(drop=True)
+    return df, info
+
+
+def get_kline(symbol: str, market: Optional[str], period: str = "day90") -> dict:
+    """
+    统一多周期 K 线入口。
+    返回 {series: {...}, period, label, desc, supported, note, market}
+    """
+    meta = PERIOD_MAP.get(period) or PERIOD_MAP["day90"]
+    info = normalize_symbol(symbol, market)
+    mkt = info["market"]
+    note = ""
+
+    if meta["kind"] == "minute":
+        try:
+            df, info = _minute_bars(symbol, market, meta["ak"])
+            note = "%s · 含实时盘中数据" % meta["desc"]
+        except Exception as e:  # noqa: BLE001
+            if "MINUTE_UNSUPPORTED" in str(e):
+                note = "%s 暂不支持分钟线（数据源仅覆盖 A 股），已自动切换为近 30 日日K" % mkt
+            else:
+                note = "分钟线拉取失败，已切换为近 30 日日K（%s）" % str(e)[:60]
+                logger.warning("分钟线失败 %s: %s", info["code"], str(e)[:100])
+            meta = PERIOD_MAP["day30"]
+            df, info = get_history(symbol, market, days=260)
+            df = df.tail(meta["days"]).reset_index(drop=True)
+    elif meta["kind"] in ("week", "month"):
+        df, info = get_history(symbol, market, days=max(meta["days"], 300))
+        df = _resample_ohlc(df, "W-FRI" if meta["kind"] == "week" else "ME")
+        df = df.tail(120 if meta["kind"] == "week" else 60).reset_index(drop=True)
+        note = meta["desc"]
+    else:
+        df, info = get_history(symbol, market, days=max(meta["days"] + 60, 120))
+        df = df.tail(meta["days"]).reset_index(drop=True)
+        note = meta["desc"]
+
+    # 转成前端图表结构
+    def _col(name, nd=2):
+        if name not in df.columns:
+            return [None] * len(df)
+        return [None if v != v else round(float(v), nd) for v in df[name]]
+
+    series = {
+        "dates": [str(x) for x in df["date"].tolist()],
+        "kline": [[float(o), float(c), float(lo), float(hi)] for o, c, lo, hi in
+                  zip(df["open"], df["close"], df["low"], df["high"])],
+        "volume": [0 if v != v else float(v) for v in df.get("volume", [0] * len(df))],
+        "close": _col("close"),
+    }
+    return {"series": series, "period": period, "label": meta["label"],
+            "desc": meta["desc"], "note": note, "market": mkt,
+            "name": info.get("name") or info["code"],
+            "count": len(df), "supported": True}
+
+
 def _f(v):
     try:
         if v is None or pd.isna(v):
@@ -1248,9 +1356,129 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------------
+# 1a. 海外财经新闻（RSS 多源）
+# ----------------------------------------------------------------------------
+# 实测可用（沙箱/Render 均可直连）：
+#   ✅ CNBC 头条/经济/金融   ✅ MarketWatch   ✅ Nasdaq   ✅ Fortune
+#   ✅ Seeking Alpha   ✅ 美联储 Fed   ✅ 欧洲央行 ECB   ✅ 英国央行 BoE
+#   ❌ Reuters / Bloomberg / FT / WSJ 本站 —— 直连被拦（反爬/地域限制）
+#      → 其内容可由 CNBC/MarketWatch/Nasdaq 等转载源间接覆盖
+# ⚠️ WSJ 的公开 RSS 是陈年缓存（日期停在 2025-01），已剔除
+# ----------------------------------------------------------------------------
+_UA = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"),
+       "Accept": "application/rss+xml, application/xml, text/xml, */*"}
+
+OVERSEAS_FEEDS = [
+    # (显示名, 区域标签, URL)
+    ("CNBC", "美国", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"),
+    ("CNBC 经济", "美国", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
+    ("CNBC 金融", "美国", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+    ("MarketWatch", "美国", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+    ("Nasdaq", "美国", "https://www.nasdaq.com/feed/rssoutbound?category=Markets"),
+    ("Fortune", "美国", "https://fortune.com/feed/"),
+    ("Seeking Alpha", "美国", "https://seekingalpha.com/market_currents.xml"),
+    ("美联储", "央行", "https://www.federalreserve.gov/feeds/press_all.xml"),
+    ("欧洲央行", "央行", "https://www.ecb.europa.eu/rss/press.html"),
+    ("英国央行", "央行", "https://www.bankofengland.co.uk/rss/news"),
+]
+
+
+def _parse_rss(url: str, source: str, region: str, limit: int = 20) -> list[dict]:
+    """抓取并解析单个 RSS，返回统一结构。失败静默返回空列表。"""
+    try:
+        import requests as _rq
+        from bs4 import BeautifulSoup
+        r = _rq.get(url, headers=_UA, timeout=10)
+        if r.status_code != 200 or not r.content:
+            return []
+        soup = BeautifulSoup(r.content, "xml")
+        out = []
+        for it in soup.find_all("item")[:limit]:
+            title = (it.title.get_text(strip=True) if it.title else "")
+            if not title:
+                continue
+            link = (it.link.get_text(strip=True) if it.link else "")
+            pub = (it.pubDate.get_text(strip=True) if it.pubDate else "")
+            desc = (it.description.get_text(strip=True) if it.description else "")
+            desc = re.sub(r"<[^>]+>", " ", desc)
+            desc = re.sub(r"\s+", " ", desc).strip()
+            out.append({
+                "title": title[:180],
+                "summary": desc[:300],
+                "time": _rss_time_to_local(pub),
+                "url": link,
+                "source": source,
+                "region": region,
+                "lang": "en",
+            })
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RSS 失败 %s: %s", source, str(e)[:100])
+        return []
+
+
+def _rss_time_to_local(s: str) -> str:
+    """RSS 的 RFC822 时间 → 'YYYY-MM-DD HH:MM'（本地时区）。解析失败原样返回。"""
+    if not s:
+        return ""
+    s = s.strip()
+    fmts = ["%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z",
+            "%a, %d %b %Y %H:%M %z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ"]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s.replace("GMT", "+0000"), fmt)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:  # noqa: BLE001
+            continue
+    return s[:25]
+
+
+def get_overseas_news(limit: int = 40, sources: Optional[list] = None) -> dict:
+    """
+    并行抓取海外财经新闻。
+    sources: 可选，只取指定来源（按显示名匹配）。
+    返回 {"items": [...], "sources": [...], "failed": [...]}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    feeds = OVERSEAS_FEEDS
+    if sources:
+        want = {s.lower() for s in sources}
+        feeds = [f for f in feeds if f[0].lower() in want]
+
+    items, ok_src, failed = [], [], []
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(_parse_rss, url, name, region): (name, url)
+                for name, region, url in feeds}
+        for fut in as_completed(futs):
+            name, _ = futs[fut]
+            got = fut.result() or []
+            if got:
+                ok_src.append(name)
+                items.extend(got)
+            else:
+                failed.append(name)
+
+    # 按时间倒序 + 标题去重
+    seen, uniq = set(), []
+    for it in sorted(items, key=lambda x: x.get("time", ""), reverse=True):
+        key = it["title"][:60].lower()
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(it)
+
+    return {"items": uniq[:limit], "sources": sorted(set(ok_src)),
+            "failed": sorted(set(failed)), "total": len(uniq)}
+
+
+# ----------------------------------------------------------------------------
 # 1. 金融新闻
 # ----------------------------------------------------------------------------
-def get_news(limit: int = 40) -> list[dict]:
+def get_news(limit: int = 40, include_overseas: bool = True) -> list[dict]:
     """聚合新闻快讯，按时间倒序。多源合并 + 去重。"""
     items: list[dict] = []
 
@@ -1283,6 +1511,16 @@ def get_news(limit: int = 40) -> list[dict]:
             })
     except Exception as e:  # noqa: BLE001
         logger.warning("新浪快讯失败: %s", str(e)[:100])
+
+    # 源3：海外财经（CNBC / MarketWatch / Nasdaq / Fortune / 三大央行）
+    if include_overseas:
+        try:
+            ov = get_overseas_news(limit=limit)
+            for it in ov.get("items", []):
+                it.setdefault("region", "海外")
+                items.append(it)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("海外新闻失败: %s", str(e)[:100])
 
     # 去重（同标题）并按时间倒序
     seen, uniq = set(), []
@@ -1569,6 +1807,35 @@ PRESETS = {
         "conditions": {"new_high_n": 60, "vol_surge": 1.2},
     },
 }
+
+
+# 可勾选的指标条件清单（前端多选面板用）
+CONDITION_META = [
+    # key,          显示名,            参数?, 参数默认, 参数说明,        分组
+    ("ma_bull",      "均线多头排列",     None,  None,  "MA5>MA10>MA20",           "趋势"),
+    ("above_ma20",   "站上 MA20",        None,  None,  "收盘价 > 20日均线",        "趋势"),
+    ("above_ma60",   "站上 MA60",        None,  None,  "收盘价 > 60日均线",        "趋势"),
+    ("price_up_n",   "连涨 N 日",        "n",   3,     "近 N 日累计上涨",          "趋势"),
+    ("new_high_n",   "创 N 日新高",      "n",   60,    "突破 N 日最高价",          "突破"),
+    ("boll_break_up","突破布林上轨",     None,  None,  "向上突破 BOLL 上轨",       "突破"),
+    ("day_up",       "当日上涨",         None,  None,  "今日收盘 > 昨日收盘",      "动量"),
+    ("vol_surge",    "放量（量比）",     "x",   1.5,   "成交量 / 5日均量 阈值",    "量能"),
+    ("macd_golden",  "MACD 多头",        None,  None,  "DIF > DEA（金叉状态）",    "指标"),
+    ("macd_cross_up","MACD 当日金叉",    None,  None,  "今日 DIF 上穿 DEA",        "指标"),
+    ("kdj_golden",   "KDJ 金叉",         None,  None,  "K 上穿 D",                 "指标"),
+    ("kdj_oversold", "KDJ 超卖",         None,  None,  "K/D 处于超卖区",           "指标"),
+    ("boll_touch_low","触及布林下轨",    None,  None,  "价格接近 BOLL 下轨",       "指标"),
+    ("score_above",  "综合评分 ≥ N",     "score", 70,  "五维技术评分阈值（0-100）", "综合"),
+]
+
+
+def list_conditions() -> list[dict]:
+    """返回可勾选的指标条件清单。"""
+    out = []
+    for key, name, pname, pdef, desc, group in CONDITION_META:
+        out.append({"key": key, "name": name, "param": pname,
+                    "default": pdef, "desc": desc, "group": group})
+    return out
 
 
 def list_presets() -> list[dict]:
@@ -2387,6 +2654,96 @@ body {
 
 ::-webkit-scrollbar-track { background: transparent; }
 
+
+.news-filter-src {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(128, 128, 128, .25);
+}
+.nf-mini {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 10px;
+  opacity: .85;
+}
+.nf-mini.active { opacity: 1; font-weight: 600; }
+.news-region {
+  display: inline-block;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  margin-right: 6px;
+  border-radius: 4px;
+  background: rgba(64, 158, 255, .14);
+  color: #409eff;
+  border: 1px solid rgba(64, 158, 255, .3);
+  vertical-align: middle;
+}
+li.is-overseas { border-left: 2px solid rgba(64, 158, 255, .45); padding-left: 8px; }
+.news-en { font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+.news-title.news-en { font-size: 13.5px; line-height: 1.45; }
+.news-summary.news-en { font-size: 12px; opacity: .78; }
+
+
+.period-bars { display: flex; flex-direction: column; gap: 6px; }
+.period-group { flex-wrap: wrap; align-items: center; gap: 4px; }
+.pg-label {
+  font-size: 11px; opacity: .55; margin-right: 4px; letter-spacing: .5px;
+}
+#periodKindTabs .tab { font-size: 12px; padding: 4px 10px; }
+#periodTabs .tab { font-size: 11.5px; padding: 3px 9px; }
+@media (max-width: 560px) {
+  .pg-label { display: none; }
+  #periodKindTabs .tab { font-size: 11.5px; padding: 3px 8px; }
+  #periodTabs .tab { font-size: 11px; padding: 3px 7px; }
+}
+
+
+.kline-note {
+  font-size: 11.5px;
+  opacity: .62;
+  padding: 2px 10px 4px;
+  letter-spacing: .2px;
+}
+
+
+.scr-hint { font-size: 11.5px; opacity: .6; margin: 4px 0 8px; line-height: 1.5; }
+.scr-cond-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 10px 0 6px; padding-top: 8px;
+  border-top: 1px dashed rgba(128, 128, 128, .22);
+}
+.scr-cond-title { font-size: 12px; font-weight: 600; opacity: .85; }
+.scr-conditions {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+}
+.scr-cond {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 10px; border-radius: 14px; cursor: pointer;
+  font-size: 11.5px; user-select: none;
+  border: 1px solid rgba(128, 128, 128, .28);
+  background: rgba(128, 128, 128, .07);
+  transition: all .15s;
+}
+.scr-cond:active { transform: scale(.97); }
+.scr-cond.on {
+  border-color: rgba(64, 158, 255, .75);
+  background: rgba(64, 158, 255, .16);
+  color: #409eff;
+  font-weight: 600;
+}
+.scr-cond input { display: none; }
+.scr-cond-param {
+  width: 46px; font-size: 11px; padding: 1px 4px;
+  border-radius: 4px; border: 1px solid rgba(128, 128, 128, .35);
+  background: rgba(0, 0, 0, .18); color: inherit;
+}
+.preset-btn.multi.active::after {
+  content: "✓"; position: absolute; top: 4px; right: 7px;
+  font-size: 11px; color: #409eff; font-weight: 700;
+}
+.preset-btn { position: relative; }
+#scrCondClear { font-size: 11px; padding: 2px 8px; }
+
 </style>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
@@ -2440,11 +2797,12 @@ body {
     </div>
     <div class="news-layout">
       <div class="card news-main">
-        <div class="news-filter">
+        <div class="news-filter" id="newsFilter">
           <button class="nf active" data-src="all">全部</button>
-          <button class="nf" data-src="东方财富">东方财富</button>
-          <button class="nf" data-src="新浪财经">新浪财经</button>
+          <button class="nf" data-src="__cn">🇨🇳 境内</button>
+          <button class="nf" data-src="__ov">🌍 海外</button>
         </div>
+        <div class="news-filter news-filter-src" id="newsFilterSrc"></div>
         <ul class="news-list" id="newsList"><li class="ph">加载中…</li></ul>
       </div>
       <div class="news-side">
@@ -2574,17 +2932,31 @@ body {
       <div class="tech-right">
         <section class="card chart-card">
           <div class="chart-toolbar">
-            <div class="tabs" id="periodTabs">
-              <button class="tab" data-days="60">近3月</button>
-              <button class="tab active" data-days="120">近半年</button>
-              <button class="tab" data-days="250">近1年</button>
-              <button class="tab" data-days="500">近2年</button>
+            <div class="period-bars">
+              <div class="tabs period-group" id="periodKindTabs">
+                <span class="pg-label">粒度</span>
+                <button class="tab pk" data-kind="minute">分时</button>
+                <button class="tab pk active" data-kind="day">日K</button>
+                <button class="tab pk" data-kind="week">周K</button>
+                <button class="tab pk" data-kind="month">月K</button>
+              </div>
+              <div class="tabs period-group" id="periodTabs">
+                <span class="pg-label">范围</span>
+                <button class="tab" data-period="min1">1分</button>
+                <button class="tab" data-period="min5">5分</button>
+                <button class="tab" data-period="min15">15分</button>
+                <button class="tab" data-period="min30">30分</button>
+                <button class="tab" data-period="min60">60分</button>
+                <button class="tab active" data-period="day90">近3月</button>
+                <button class="tab" data-period="day250">近1年</button>
+              </div>
             </div>
             <div class="indicator-toggles" id="indToggles">
               <label><input type="checkbox" data-ind="ma" checked> 均线</label>
               <label><input type="checkbox" data-ind="boll"> BOLL</label>
             </div>
           </div>
+          <div id="klineNote" class="kline-note">—</div>
           <div id="klineChart" class="chart chart-tall"></div>
           <div id="volChart" class="chart chart-short"></div>
           <div id="macdChart" class="chart chart-short"></div>
@@ -2607,7 +2979,16 @@ body {
     <!-- 选股器 -->
     <section class="card screener-card">
       <h3 class="card-title">技术选股器 · 按指标筛选股票</h3>
+      <div class="scr-hint">
+        可多选：预设策略之间为「且」关系；下方还能再勾选独立指标进一步收窄。
+      </div>
       <div class="screener-presets" id="screenerPresets"></div>
+
+      <div class="scr-cond-head">
+        <span class="scr-cond-title">精细指标（可多选）</span>
+        <button class="mini-btn" id="scrCondClear" type="button">清空</button>
+      </div>
+      <div class="scr-conditions" id="screenerConditions"></div>
       <div class="screener-toolbar">
         <div class="scr-opt">
           <label>候选池规模</label>
@@ -2665,13 +3046,19 @@ body {
     board: "news",
     symbol: "600519",
     days: 120,
+    periodKind: "day",
+    period: "day90",
     showMA: true,
     showBoll: false,
     raw: null,
     news: [],
     newsSrc: "all",
+    newsSources: null,
     sectorKind: "industry",
-    preset: "macd_golden",
+    presets: ["macd_golden"],   // 多选：预设策略 key 数组
+    presetMap: {},
+    condMeta: [],
+    extraConds: {},             // 多选：精细指标 {key: 参数值}
   };
 
   let gaugeChart, klineChart, volChart, macdChart, kdjChart, rsiChart, watchChart;
@@ -2746,8 +3133,10 @@ body {
     const ul = $("#newsList");
     ul.innerHTML = '<li class="ph">加载中…</li>';
     try {
-      state.news = await api("/api/news?limit=50");
+      state.news = await api("/api/news?limit=80");
       $("#newsTime").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+      if (!state.newsSources) await loadNewsSources();
+      renderNewsFilterSrc();
       renderNews();
     } catch (e) {
       ul.innerHTML = `<li class="ph">新闻加载失败：${e.message}</li>`;
@@ -2756,19 +3145,49 @@ body {
     loadNewsGainers();
   }
 
+  async function loadNewsSources() {
+    try {
+      state.newsSources = await api("/api/news/sources");
+    } catch (e) {
+      state.newsSources = { domestic: [], overseas: [], unavailable: [] };
+    }
+  }
+
+  function renderNewsFilterSrc() {
+    const box = $("#newsFilterSrc");
+    if (!box || !state.newsSources) return;
+    const ov = state.newsSources.overseas || [];
+    box.innerHTML = ov.map((s) =>
+      `<button class="nf nf-mini" data-src="${s.name}" title="${s.region}">${s.name}</button>`
+    ).join("");
+  }
+
+  const CN_SOURCES = ["新浪财经", "东方财富"];
+
   function renderNews() {
     const ul = $("#newsList");
-    const list = state.newsSrc === "all" ? state.news : state.news.filter((n) => n.source === state.newsSrc);
+    const cur = state.newsSrc || "all";
+    let list;
+    if (cur === "all") list = state.news;
+    else if (cur === "__cn") list = state.news.filter((n) => CN_SOURCES.includes(n.source));
+    else if (cur === "__ov") list = state.news.filter((n) => !CN_SOURCES.includes(n.source));
+    else list = state.news.filter((n) => n.source === cur);
+
     if (!list.length) { ul.innerHTML = '<li class="ph">暂无新闻</li>'; return; }
-    ul.innerHTML = list.map((n) => `
-      <li ${n.url ? `data-url="${n.url}"` : ""}>
+    ul.innerHTML = list.map((n) => {
+      const isOv = !CN_SOURCES.includes(n.source);
+      const tag = isOv ? `<span class="news-region">${n.region || "海外"}</span>` : "";
+      const langCls = n.lang === "en" ? " news-en" : "";
+      return `
+      <li ${n.url ? `data-url="${n.url}"` : ""} class="${isOv ? "is-overseas" : ""}">
         <div class="news-meta">
-          <span class="news-src">${n.source}</span>
-          <span class="news-time">${(n.time || "").slice(-8)}</span>
+          ${tag}<span class="news-src">${n.source}</span>
+          <span class="news-time">${(n.time || "").slice(-11) || ""}</span>
         </div>
-        <div class="news-title">${escapeHtml(n.title)}</div>
-        ${n.summary && n.summary !== n.title ? `<div class="news-summary">${escapeHtml(String(n.summary).slice(0, 160))}</div>` : ""}
-      </li>`).join("");
+        <div class="news-title${langCls}">${escapeHtml(n.title)}</div>
+        ${n.summary && n.summary !== n.title ? `<div class="news-summary${langCls}">${escapeHtml(String(n.summary).slice(0, 180))}</div>` : ""}
+      </li>`;
+    }).join("");
   }
 
   async function loadSentiment() {
@@ -3199,10 +3618,71 @@ body {
       renderRSI(data.chart);
       setTimeout(resizeAll, 60);
       loadFinancials(symbol);
+      loadKline(symbol);   // 按当前周期拉更精细的 K 线覆盖主图
     } catch (e) {
       toast("分析失败：" + e.message);
     } finally {
       if (!silent) showLoading(false);
+    }
+  }
+
+  /* ---------------------------------------------------------- 多周期 K 线 */
+  const PERIOD_BY_KIND = {
+    minute: ["min1", "min5", "min15", "min30", "min60"],
+    day: ["day90", "day250", "day5", "day30"],
+    week: ["week"],
+    month: ["month"],
+  };
+
+  function setPeriodKind(kind) {
+    state.periodKind = kind;
+    const list = PERIOD_BY_KIND[kind] || PERIOD_BY_KIND.day;
+    const box = $("#periodTabs");
+    box.innerHTML = list.map((p, i) =>
+      `<button class="tab${i === 0 ? " active" : ""}" data-period="${p}">${PERIOD_LABEL[p] || p}</button>`
+    ).join("");
+    state.period = list[0];
+    if (state.symbol) loadKline(state.symbol);
+  }
+
+  const PERIOD_LABEL = {
+    min1: "1分", min5: "5分", min15: "15分", min30: "30分", min60: "60分",
+    day5: "近5日", day30: "近30日", day90: "近3月", day250: "近1年",
+    week: "近2年周K", month: "近4年月K",
+  };
+
+  async function loadKline(symbol) {
+    if (!symbol) return;
+    const period = state.period || "day90";
+    const noteEl = $("#klineNote");
+    if (noteEl) noteEl.textContent = "加载 " + (PERIOD_LABEL[period] || period) + "…";
+    try {
+      const d = await api(`/api/kline?symbol=${encodeURIComponent(symbol)}&period=${period}`);
+      if (d.note && noteEl) noteEl.textContent = d.note + `　共 ${d.count} 根`;
+      else if (noteEl) noteEl.textContent = `${d.desc}　共 ${d.count} 根`;
+      // 与主图渲染兼容：把 series 合并进 raw.chart 的相关字段
+      if (state.raw && state.raw.chart) {
+        const c = state.raw.chart;
+        c.dates = d.series.dates;
+        c.kline = d.series.kline;
+        c.volume = d.series.volume;
+        // 分钟线不再叠均线/BOLL（长度不匹配），日线及以上保留
+        const isMin = period.startsWith("min");
+        if (isMin) {
+          ["ma5", "ma10", "ma20", "ma60", "boll_up", "boll_mid", "boll_low",
+           "dif", "dea", "macd", "k", "d", "j", "rsi6", "rsi14"]
+            .forEach((k) => { c[k] = new Array(d.series.dates.length).fill(null); });
+        }
+        renderKline(c);
+        renderVol(c);
+        if (!isMin) { renderMacd(c); renderKdj(c); renderRSI(c); }
+        else {
+          [macdChart, kdjChart, rsiChart].forEach((ch) => ch && ch.clear());
+        }
+        setTimeout(resizeAll, 50);
+      }
+    } catch (e) {
+      if (noteEl) noteEl.textContent = "K线加载失败：" + e.message;
     }
   }
 
@@ -3219,14 +3699,55 @@ body {
     try {
       const list = await api("/api/screener/presets");
       box.innerHTML = list.map((p) => `
-        <button class="preset-btn ${p.key === state.preset ? "active" : ""}" data-preset="${p.key}">
+        <button class="preset-btn multi ${state.presets.includes(p.key) ? "active" : ""}" data-preset="${p.key}">
           <span class="preset-name">${p.name}</span>
           <span class="preset-desc">${p.desc}</span>
         </button>`).join("");
       box.dataset.loaded = "1";
+      state.presetMap = {};
+      list.forEach((p) => { state.presetMap[p.key] = p; });
+      await loadConditions();
     } catch (e) {
       box.innerHTML = '<div class="ph">策略加载失败</div>';
     }
+  }
+
+  /* 精细指标多选面板 */
+  async function loadConditions() {
+    const box = $("#screenerConditions");
+    if (!box || box.dataset.loaded) return;
+    try {
+      const list = await api("/api/screener/conditions");
+      state.condMeta = list;
+      box.innerHTML = list.map((c) => {
+        const checked = state.extraConds[c.key] !== undefined;
+        const val = checked ? state.extraConds[c.key] : c.default;
+        const param = c.param
+          ? `<input class="scr-cond-param" data-param="${c.key}" type="number"
+               step="${c.param === "x" ? "0.1" : "1"}" value="${val}" title="${c.desc}">`
+          : "";
+        return `<label class="scr-cond ${checked ? "on" : ""}" data-cond="${c.key}"
+                        title="${c.desc}">
+          <input type="checkbox" ${checked ? "checked" : ""}>${c.name}${param}
+        </label>`;
+      }).join("");
+      box.dataset.loaded = "1";
+    } catch (e) {
+      box.innerHTML = '<div class="ph">指标清单加载失败</div>';
+    }
+  }
+
+  /* 合并所有勾选条件为后端条件字典 */
+  function collectConditions() {
+    const cond = {};
+    // 预设策略合并
+    (state.presets || []).forEach((k) => {
+      const p = state.presetMap && state.presetMap[k];
+      if (p && p.conditions) Object.assign(cond, p.conditions);
+    });
+    // 精细指标覆盖/追加
+    Object.entries(state.extraConds || {}).forEach(([k, v]) => { cond[k] = v; });
+    return cond;
   }
 
   async function runScreener() {
@@ -3236,13 +3757,13 @@ body {
     $("#scrStatus").textContent = "扫描中，请稍候…";
     tbody.innerHTML = '<tr><td colspan="8" class="ph">正在扫描（约 20-60 秒）…</td></tr>';
     try {
-      const presets = await api("/api/screener/presets");
-      const preset = presets.find((p) => p.key === state.preset);
-      if (!preset) throw new Error("请先选择策略");
+      const conditions = collectConditions();
+      const nCond = Object.keys(conditions).length;
+      if (!nCond) throw new Error("请至少勾选一个策略或指标");
       const res = await fetch("/api/screener", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          conditions: preset.conditions,
+          conditions: conditions,
           pool_size: parseInt($("#scrPool").value, 10),
           min_amount: parseFloat($("#scrAmount").value),
           max_results: 40,
@@ -3251,7 +3772,7 @@ body {
       const json = await res.json();
       if (!json.ok) throw new Error(json.error);
       const d = json.data;
-      $("#scrStatus").textContent = `扫描 ${d.total_scanned} 只，命中 ${d.matched} 只`;
+      $("#scrStatus").textContent = `条件 ${nCond} 项 · 扫描 ${d.total_scanned} 只 · 命中 ${d.matched} 只`;
       if (!d.results.length) {
         tbody.innerHTML = '<tr><td colspan="8" class="ph">没有符合条件的股票，可尝试更换策略或扩大候选池</td></tr>';
         return;
@@ -3364,12 +3885,12 @@ body {
 
     $("#favBtn").addEventListener("click", () => addWatch(state.symbol));
 
-    $(".news-filter").addEventListener("click", (e) => {
-      const b = e.target.closest(".nf");
-      if (!b) return;
-      $$(".nf").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      state.newsSrc = b.dataset.src;
+    document.addEventListener("click", (e) => {
+      const btn = e.target.closest(".nf");
+      if (!btn) return;
+      document.querySelectorAll(".nf").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      state.newsSrc = btn.dataset.src;
       renderNews();
     });
 
@@ -3419,12 +3940,23 @@ body {
 
     $("#periodTabs").addEventListener("click", (e) => {
       const b = e.target.closest(".tab");
-      if (!b) return;
+      if (!b || !b.dataset.period) return;
       $$("#periodTabs .tab").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
-      state.days = parseInt(b.dataset.days, 10);
-      analyze(state.symbol, true);
+      state.period = b.dataset.period;
+      loadKline(state.symbol);
     });
+
+    const kindBox = $("#periodKindTabs");
+    if (kindBox) {
+      kindBox.addEventListener("click", (e) => {
+        const b = e.target.closest(".pk");
+        if (!b) return;
+        $$("#periodKindTabs .pk").forEach((x) => x.classList.remove("active"));
+        b.classList.add("active");
+        setPeriodKind(b.dataset.kind);
+      });
+    }
 
     $("#indToggles").addEventListener("change", (e) => {
       const ind = e.target.dataset.ind;
@@ -3444,10 +3976,58 @@ body {
     $("#screenerPresets").addEventListener("click", (e) => {
       const b = e.target.closest(".preset-btn");
       if (!b) return;
-      $$(".preset-btn").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      state.preset = b.dataset.preset;
+      const key = b.dataset.preset;
+      const i = state.presets.indexOf(key);
+      if (i >= 0) state.presets.splice(i, 1);
+      else state.presets.push(key);
+      b.classList.toggle("active");
     });
+
+    const condBox = $("#screenerConditions");
+    if (condBox) {
+      condBox.addEventListener("click", (e) => {
+        const lab = e.target.closest(".scr-cond");
+        if (!lab) return;
+        // 点到参数输入框时不要切换勾选
+        if (e.target.classList.contains("scr-cond-param")) return;
+        e.preventDefault();
+        const key = lab.dataset.cond;
+        const meta = (state.condMeta || []).find((c) => c.key === key);
+        if (state.extraConds[key] !== undefined) {
+          delete state.extraConds[key];
+          lab.classList.remove("on");
+        } else {
+          const inp = lab.querySelector(".scr-cond-param");
+          const v = inp ? parseFloat(inp.value) : (meta ? meta.default : true);
+          state.extraConds[key] = meta && meta.param ? (isNaN(v) ? meta.default : v) : true;
+          lab.classList.add("on");
+        }
+      });
+      condBox.addEventListener("input", (e) => {
+        if (!e.target.classList.contains("scr-cond-param")) return;
+        const key = e.target.dataset.param;
+        const v = parseFloat(e.target.value);
+        if (state.extraConds[key] !== undefined && !isNaN(v)) state.extraConds[key] = v;
+      });
+    }
+
+    const clearBtn = $("#scrCondClear");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", () => {
+        state.extraConds = {};
+        state.presets = [];
+        $$(".scr-cond").forEach((x) => x.classList.remove("on"));
+        $$(".scr-cond input[type=checkbox]").forEach((x) => { x.checked = false; });
+        $$(".preset-btn").forEach((x) => x.classList.remove("active"));
+        // 参数复位为默认
+        (state.condMeta || []).forEach((c) => {
+          const inp = document.querySelector(`.scr-cond-param[data-param="${c.key}"]`);
+          if (inp) inp.value = c.default;
+        });
+        $("#scrStatus").textContent = "已清空，请重新选择";
+      });
+    }
+
     $("#scrRunBtn").addEventListener("click", runScreener);
   }
 
@@ -3489,8 +4069,10 @@ Flask 应用：提供页面与 REST API。
 # (合并自各模块的 __future__ 已省略)
 
 import argparse
+import json
 import logging
 import os
+import threading
 import sys
 import traceback
 
@@ -3507,8 +4089,116 @@ logger = logging.getLogger("stocklens")
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 
-# 自选股（内存存储，重启即清空；可扩展为持久化）
-WATCHLIST: list[str] = ["600519", "000001", "300750", "00700", "AAPL"]
+# ============================================================
+# 自选股持久化存储
+# ------------------------------------------------------------
+# 三重保障，按优先级：
+#   1. GitHub Gist（最永久，重新部署也不丢）—— 需配置 GIST_ID + GIST_TOKEN
+#   2. 本地磁盘文件（应对进程重启/休眠唤醒）
+#   3. 内置默认值（首次启动兜底）
+#
+# 配置方法（Render 环境变量）：
+#   GIST_ID    : 已创建好的 Gist 的 ID
+#   GIST_TOKEN : 有 gist 权限的 GitHub Personal Access Token
+# ============================================================
+DEFAULT_WATCHLIST = ["600519", "000001", "300750", "00700", "AAPL"]
+_DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+WATCHLIST_FILE = os.path.join(_DATA_DIR, "watchlist.json")
+GIST_ID = os.getenv("GIST_ID", "").strip()
+GIST_TOKEN = os.getenv("GIST_TOKEN", "").strip()
+_GIST_FILENAME = "stocklens-watchlist.json"
+_watch_lock = threading.Lock()
+
+
+def _watch_from_disk():
+    try:
+        with open(WATCHLIST_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _watch_to_disk(items):
+    try:
+        os.makedirs(os.path.dirname(WATCHLIST_FILE), exist_ok=True)
+        tmp = WATCHLIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WATCHLIST_FILE)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("自选股写磁盘失败: %s", str(e)[:120])
+        return False
+
+
+def _watch_from_gist():
+    """从 GitHub Gist 读取（真正的跨部署持久化）。"""
+    if not (GIST_ID and GIST_TOKEN):
+        return None
+    try:
+        r = requests.get("https://api.github.com/gists/" + GIST_ID,
+                         headers={"Authorization": "Bearer " + GIST_TOKEN,
+                                  "Accept": "application/vnd.github+json"},
+                         timeout=8)
+        if r.status_code != 200:
+            logger.warning("读取 Gist 失败 HTTP %s", r.status_code)
+            return None
+        files = (r.json() or {}).get("files") or {}
+        f = files.get(_GIST_FILENAME) or next(iter(files.values()), None)
+        if not f:
+            return None
+        content = f.get("content")
+        if content is None and f.get("raw_url"):
+            content = requests.get(f["raw_url"], timeout=8).text
+        data = json.loads(content or "[]")
+        if isinstance(data, dict):
+            data = data.get("watchlist") or []
+        return [str(x) for x in data if str(x).strip()]
+    except Exception as e:  # noqa: BLE001
+        logger.warning("读取 Gist 异常: %s", str(e)[:120])
+        return None
+
+
+def _watch_to_gist(items):
+    """写回 GitHub Gist。"""
+    if not (GIST_ID and GIST_TOKEN):
+        return False
+    try:
+        payload = {"files": {_GIST_FILENAME: {
+            "content": json.dumps(items, ensure_ascii=False, indent=2)}}}
+        r = requests.patch("https://api.github.com/gists/" + GIST_ID,
+                           headers={"Authorization": "Bearer " + GIST_TOKEN,
+                                    "Accept": "application/vnd.github+json"},
+                           json=payload, timeout=10)
+        if r.status_code in (200, 201):
+            return True
+        logger.warning("写入 Gist 失败 HTTP %s: %s", r.status_code, r.text[:150])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("写入 Gist 异常: %s", str(e)[:120])
+    return False
+
+
+def _watch_load():
+    """按优先级加载：Gist > 磁盘 > 默认值。"""
+    for loader, name in ((_watch_from_gist, "gist"), (_watch_from_disk, "disk")):
+        got = loader()
+        if got is not None:
+            logger.info("自选股来源: %s (%d 只)", name, len(got))
+            return got
+    logger.info("自选股来源: 默认值 (%d 只)", len(DEFAULT_WATCHLIST))
+    return list(DEFAULT_WATCHLIST)
+
+
+def _watch_save(items):
+    """双写：Gist + 磁盘。"""
+    _watch_to_disk(items)
+    _watch_to_gist(items)
+
+
+WATCHLIST: list[str] = _watch_load()
 
 
 def ok(data=None, **extra):
@@ -3603,6 +4293,33 @@ def api_analyze():
         return fail(str(e), 500)
 
 
+@app.route("/api/kline")
+def api_kline():
+    """
+    多周期 K 线。GET ?symbol=600519&period=min5|day30|week|month...
+    周期列表：min1,min5,min15,min30,min60,day5,day30,day90,day250,week,month
+    """
+    symbol = request.args.get("symbol", "").strip()
+    market = request.args.get("market", "").strip() or None
+    period = request.args.get("period", "day90").strip()
+    if not symbol:
+        return fail("缺少参数 symbol")
+    if period not in ds.PERIOD_MAP:
+        return fail("未知周期: %s（可选：%s）" % (period, ",".join(ds.PERIOD_MAP)))
+    try:
+        return ok(ds.get_kline(symbol, market, period))
+    except Exception as e:  # noqa: BLE001
+        logger.error(traceback.format_exc())
+        return fail("K线获取失败: %s" % e, 500)
+
+
+@app.route("/api/kline/periods")
+def api_kline_periods():
+    """可选周期列表（前端渲染切换按钮用）。"""
+    return ok([{"key": k, "label": v["label"], "desc": v["desc"],
+                "kind": v["kind"]} for k, v in ds.PERIOD_MAP.items()])
+
+
 @app.route("/api/financials")
 def api_financials():
     symbol = request.args.get("symbol", "").strip()
@@ -3648,7 +4365,7 @@ def api_watchlist():
     global WATCHLIST
     if request.method == "GET":
         items = []
-        for s in WATCHLIST:
+        for s in list(WATCHLIST):
             try:
                 items.append(ds.get_quote(s))
             except Exception:  # noqa: BLE001
@@ -3661,11 +4378,45 @@ def api_watchlist():
         return fail("缺少 symbol")
     norm = ds.normalize_symbol(symbol)
     key = norm["display"]
-    if request.method == "POST":
-        if key not in WATCHLIST:
-            WATCHLIST.append(key)
-    else:
-        WATCHLIST = [x for x in WATCHLIST if ds.normalize_symbol(x)["display"] != key]
+
+    with _watch_lock:
+        cur = list(WATCHLIST)
+        if request.method == "POST":
+            if key not in cur:
+                cur.append(key)
+        else:
+            cur = [x for x in cur if ds.normalize_symbol(x)["display"] != key]
+        WATCHLIST = cur
+        _watch_save(cur)
+    return ok(WATCHLIST)
+
+
+@app.route("/api/watchlist/export")
+def api_watchlist_export():
+    """导出当前自选股（便于备份/迁移）。"""
+    return ok({"watchlist": list(WATCHLIST),
+               "gist_enabled": bool(GIST_ID and GIST_TOKEN)})
+
+
+@app.route("/api/watchlist/import", methods=["POST"])
+def api_watchlist_import():
+    """导入自选股列表（覆盖式）。"""
+    global WATCHLIST
+    body = request.get_json(silent=True) or {}
+    items = body.get("watchlist") or []
+    if not isinstance(items, list):
+        return fail("watchlist 必须是数组")
+    cleaned = []
+    for it in items:
+        try:
+            key = ds.normalize_symbol(str(it))["display"]
+            if key not in cleaned:
+                cleaned.append(key)
+        except Exception:  # noqa: BLE001
+            continue
+    with _watch_lock:
+        WATCHLIST = cleaned
+        _watch_save(cleaned)
     return ok(WATCHLIST)
 
 
@@ -3684,6 +4435,37 @@ def api_news():
     except Exception as e:  # noqa: BLE001
         logger.error(traceback.format_exc())
         return fail(f"新闻获取失败: {e}", 500)
+
+
+@app.route("/api/news/overseas")
+def api_news_overseas():
+    """海外财经新闻（可按来源筛选）。GET ?limit=40&sources=CNBC,MarketWatch"""
+    limit = int(request.args.get("limit", 40))
+    raw = request.args.get("sources", "").strip()
+    srcs = [s.strip() for s in raw.split(",") if s.strip()] if raw else None
+    try:
+        return ok(mkt.get_overseas_news(limit=limit, sources=srcs))
+    except Exception as e:  # noqa: BLE001
+        logger.error(traceback.format_exc())
+        return fail(f"海外新闻获取失败: {e}", 500)
+
+
+@app.route("/api/news/sources")
+def api_news_sources():
+    """列出全部新闻源（境内 + 境外），供前端渲染筛选器。"""
+    return ok({
+        "domestic": [
+            {"name": "新浪财经", "region": "中国"},
+            {"name": "东方财富", "region": "中国"},
+        ],
+        "overseas": [{"name": n, "region": r} for n, r, _ in mkt.OVERSEAS_FEEDS],
+        "unavailable": [
+            {"name": "路透社 Reuters", "reason": "官网直连被反爬拦截"},
+            {"name": "彭博社 Bloomberg", "reason": "官网直连被反爬拦截"},
+            {"name": "金融时报 FT", "reason": "官网直连被反爬拦截"},
+            {"name": "华尔街日报 WSJ", "reason": "公开 RSS 为陈年缓存"},
+        ],
+    })
 
 
 @app.route("/api/hotspots")
@@ -3739,6 +4521,12 @@ def api_sentiment():
 def api_screener_presets():
     """预设选股策略列表"""
     return ok(screener.list_presets())
+
+
+@app.route("/api/screener/conditions")
+def api_screener_conditions():
+    """可选指标条件清单（用于多选面板）。"""
+    return ok(screener.list_conditions())
 
 
 @app.route("/api/screener", methods=["GET", "POST"])
@@ -3808,4 +4596,3 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
-  
